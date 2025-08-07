@@ -60,7 +60,7 @@ func main() {
 		case "Continue", "Rewind":
 			// wrappers over continueDir
 			continue
-		case "SetReturnValuesLoadConfig", "Disconnect":
+		case "SetReturnValuesLoadConfig", "Disconnect", "SetEventsFn":
 			// support functions
 			continue
 		}
@@ -192,7 +192,7 @@ func findCallCall(fndecl *ast.FuncDecl) *ast.CallExpr {
 			continue
 		}
 		fun, issel := callx.Fun.(*ast.SelectorExpr)
-		if !issel || fun.Sel.Name != "call" {
+		if !issel || (fun.Sel.Name != "call" && fun.Sel.Name != "callWhileDrainingEvents") {
 			continue
 		}
 		return callx
