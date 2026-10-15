@@ -28,6 +28,9 @@ func main() {
 	if err != nil {
 		fatal("packages.Load", err)
 	}
+	if packages.PrintErrors(pkgs) > 0 {
+		os.Exit(1)
+	}
 	var clientAst *ast.File
 	var serverMethods map[string]*types.Func
 	var info *types.Info

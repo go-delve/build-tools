@@ -237,7 +237,7 @@ func genMapping(bindings []binding) []byte {
 			if i != 0 {
 				fmt.Fprintf(docstr, ", ")
 			}
-			fmt.Fprintf(docstr, argname)
+			fmt.Fprint(docstr, argname)
 		}
 		fmt.Fprintf(docstr, ")")
 		if binding.docStr != "" {
@@ -333,6 +333,9 @@ func main() {
 	pkgs, err := packages.Load(cfg, "github.com/go-delve/delve/service/rpc2")
 	if err != nil {
 		log.Fatalf("could not load packages: %v", err)
+	}
+	if packages.PrintErrors(pkgs) > 0 {
+		os.Exit(1)
 	}
 
 	var serverMethods []*types.Func
