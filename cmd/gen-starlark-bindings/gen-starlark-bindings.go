@@ -16,9 +16,10 @@ import (
 )
 
 // getSuitableMethods returns the list of methods of service/rpc2.RPCServer that are exported as API calls
-func getSuitableMethods(pkg *types.Package, typename string) []*types.Func {
+func getSuitableMethods(pkg *types.Package, typename string, skiplist []string) []*types.Func {
 	r := []*types.Func{}
 	mset := types.NewMethodSet(types.NewPointer(pkg.Scope().Lookup(typename).Type()))
+methodLoop:
 	for i := 0; i < mset.Len(); i++ {
 		fn := mset.At(i).Obj().(*types.Func)
 
@@ -29,6 +30,12 @@ func getSuitableMethods(pkg *types.Package, typename string) []*types.Func {
 		if fn.Name() == "Command" || fn.Name() == "Restart" || fn.Name() == "State" {
 			r = append(r, fn)
 			continue
+		}
+
+		for _, toskip := range skiplist {
+			if fn.Name() == toskip {
+				continue methodLoop
+			}
 		}
 
 		sig, ok := fn.Type().(*types.Signature)
@@ -97,8 +104,9 @@ type binding struct {
 
 	argType, retType string
 
-	argNames []string
-	argTypes []string
+	argNames      []string
+	argTypes      []string
+	needsCallback bool
 
 	docStr string
 }
@@ -126,13 +134,16 @@ func processServerMethods(serverMethods []*types.Func, funcDeclByPos map[token.P
 		}
 
 		retType := sig.Params().At(1).Type().String()
+		needsCallback := true
 		switch fn.Name() {
 		case "Command":
-			retType = "rpc2.CommandOut"
+			retType = "CommandOut"
 		case "Restart":
-			retType = "rpc2.RestartOut"
+			retType = "RestartOut"
 		case "State":
-			retType = "rpc2.StateOut"
+			retType = "StateOut"
+		default:
+			needsCallback = false
 		}
 
 		docStr := ""
@@ -152,61 +163,97 @@ func processServerMethods(serverMethods []*types.Func, funcDeclByPos map[token.P
 		}
 
 		bindings[i] = binding{
-			name:     name,
-			fn:       fn,
-			argType:  sig.Params().At(0).Type().String(),
-			retType:  retType,
-			argNames: argNames,
-			argTypes: argTypes,
-			docStr:   docStr,
+			name:          name,
+			fn:            fn,
+			argType:       sig.Params().At(0).Type().String(),
+			retType:       retType,
+			argNames:      argNames,
+			argTypes:      argTypes,
+			docStr:        docStr,
+			needsCallback: needsCallback,
 		}
 	}
 	return bindings
 }
 
-func removePackagePath(typePath string) string {
+func removePackagePathAndRPC2(typePath string) string {
 	lastSlash := strings.LastIndex(typePath, "/")
 	if lastSlash < 0 {
 		return typePath
 	}
-	return typePath[lastSlash+1:]
+	typePath = typePath[lastSlash+1:]
+	firstDot := strings.Index(typePath, ".")
+	if firstDot < 0 || typePath[:firstDot] != "rpc2" {
+		return typePath
+	}
+	return typePath[firstDot+1:]
 }
 
 func genMapping(bindings []binding) []byte {
 	buf := bytes.NewBuffer([]byte{})
 
 	fmt.Fprintf(buf, "// DO NOT EDIT: auto-generated using github.com/go-delve/build-tools/cmd/gen-starlark-bindings\n\n")
-	fmt.Fprintf(buf, "package starbind\n\n")
-	fmt.Fprintf(buf, "import ( \"go.starlark.net/starlark\" \n \"github.com/go-delve/delve/service/api\" \n \"github.com/go-delve/delve/service/rpc2\" \n \"fmt\" )\n\n")
-	fmt.Fprintf(buf, "func (env *Env) starlarkPredeclare() (starlark.StringDict, map[string]string) {\n")
+	fmt.Fprintf(buf, "package rpc2\n\n")
+	fmt.Fprintf(buf, `import (
+		"go.starlark.net/starlark"
+		"github.com/go-delve/delve/service/api"
+		"github.com/go-delve/delve/service/debugger"
+		"fmt"
+		"errors"
+	)
+	
+	var errNoServer = errors.New("no server")
+	
+	type starlarkRPCCallback struct {
+		rpcRet any
+		err    error
+	}
+	
+	func (*starlarkRPCCallback) DisconnectChan() chan struct{} {
+		return nil
+	}
+	
+	func (*starlarkRPCCallback) SetupDoneChan() chan struct{} {
+		return nil
+	}
+	
+	func (cb *starlarkRPCCallback) Return(out any, err error) {
+		cb.rpcRet = out
+		cb.err = err
+	}
+	`)
+	fmt.Fprintf(buf, "func starlarkPredeclare(env *debugger.StarlarkEnv) (starlark.StringDict, map[string]string) {\n")
 	fmt.Fprintf(buf, "r := starlark.StringDict{}\n")
 	fmt.Fprintf(buf, "doc := make(map[string]string)\n\n")
 
 	for _, binding := range bindings {
 		fmt.Fprintf(buf, "r[%q] = starlark.NewBuiltin(%q, func(thread *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {", binding.name, binding.name)
-		fmt.Fprintf(buf, "if err := isCancelled(thread); err != nil { return starlark.None, decorateError(thread, err) }\n")
-		fmt.Fprintf(buf, "var rpcArgs %s\n", removePackagePath(binding.argType))
-		fmt.Fprintf(buf, "var rpcRet %s\n", removePackagePath(binding.retType))
+		fmt.Fprintf(buf, "if err := debugger.StarlarkThreadIsCancelled(thread); err != nil { return starlark.None, debugger.DecorateStarlarkError(thread, err) }\n")
+		fmt.Fprintf(buf, "s, hasServer := thread.Local(debugger.DlvThreadLocalRPCServer).(*RPCServer)\n")
+		fmt.Fprintf(buf, "if !hasServer { return starlark.None, debugger.DecorateStarlarkError(thread, errNoServer) }\n")
+		fmt.Fprintf(buf, "var rpcArgs %s\n", removePackagePathAndRPC2(binding.argType))
+		if !binding.needsCallback {
+			fmt.Fprintf(buf, "var rpcRet %s\n", removePackagePathAndRPC2(binding.retType))
+		}
 
 		// unmarshal normal unnamed arguments
 		for i := range binding.argNames {
-			fmt.Fprintf(buf, "if len(args) > %d && args[%d] != starlark.None { err := unmarshalStarlarkValue(args[%d], &rpcArgs.%s, %q); if err != nil { return starlark.None, decorateError(thread, err) } }", i, i, i, binding.argNames[i], binding.argNames[i])
+			fmt.Fprintf(buf, "if len(args) > %d && args[%d] != starlark.None { err := debugger.UnmarshalStarlarkValue(args[%d], &rpcArgs.%s, %q); if err != nil { return starlark.None, debugger.DecorateStarlarkError(thread, err) } }", i, i, i, binding.argNames[i], binding.argNames[i])
 
 			switch binding.argTypes[i] {
 			case "*github.com/go-delve/delve/service/api.LoadConfig":
 				if binding.fn.Name() != "Stacktrace" {
-					fmt.Fprintf(buf, "else { cfg := env.ctx.LoadConfig(); rpcArgs.%s = &cfg }", binding.argNames[i])
+					fmt.Fprintf(buf, "else { cfg := env.LoadConfig(); rpcArgs.%s = &cfg }", binding.argNames[i])
 				}
 			case "github.com/go-delve/delve/service/api.LoadConfig":
-				fmt.Fprintf(buf, "else { rpcArgs.%s = env.ctx.LoadConfig() }", binding.argNames[i])
+				fmt.Fprintf(buf, "else { rpcArgs.%s = env.LoadConfig() }", binding.argNames[i])
 			case "*github.com/go-delve/delve/service/api.EvalScope":
-				fmt.Fprintf(buf, "else { scope := env.ctx.Scope(); rpcArgs.%s = &scope }", binding.argNames[i])
+				fmt.Fprintf(buf, "else { scope := env.Scope(); rpcArgs.%s = &scope }", binding.argNames[i])
 			case "github.com/go-delve/delve/service/api.EvalScope":
-				fmt.Fprintf(buf, "else { rpcArgs.%s = env.ctx.Scope() }", binding.argNames[i])
+				fmt.Fprintf(buf, "else { rpcArgs.%s = env.Scope() }", binding.argNames[i])
 			}
 
 			fmt.Fprintf(buf, "\n")
-
 		}
 
 		// unmarshal keyword arguments
@@ -216,17 +263,24 @@ func genMapping(bindings []binding) []byte {
 			fmt.Fprintf(buf, "switch kv[0].(starlark.String) {\n")
 			for i := range binding.argNames {
 				fmt.Fprintf(buf, "case %q: ", binding.argNames[i])
-				fmt.Fprintf(buf, "err = unmarshalStarlarkValue(kv[1], &rpcArgs.%s, %q)\n", binding.argNames[i], binding.argNames[i])
+				fmt.Fprintf(buf, "err = debugger.UnmarshalStarlarkValue(kv[1], &rpcArgs.%s, %q)\n", binding.argNames[i], binding.argNames[i])
 			}
 			fmt.Fprintf(buf, "default: err = fmt.Errorf(\"unknown argument %%q\", kv[0])")
 			fmt.Fprintf(buf, "}\n")
-			fmt.Fprintf(buf, "if err != nil { return starlark.None, decorateError(thread, err) }\n")
+			fmt.Fprintf(buf, "if err != nil { return starlark.None, debugger.DecorateStarlarkError(thread, err) }\n")
 			fmt.Fprintf(buf, "}\n")
 		}
 
-		fmt.Fprintf(buf, "err := env.ctx.Client().CallAPI(%q, &rpcArgs, &rpcRet)\n", binding.fn.Name())
-		fmt.Fprintf(buf, "if err != nil { return starlark.None, err }\n")
-		fmt.Fprintf(buf, "return env.interfaceToStarlarkValue(&rpcRet), nil\n")
+		if binding.needsCallback {
+			fmt.Fprintf(buf, "cb := &starlarkRPCCallback{}\n")
+			fmt.Fprintf(buf, "s.%s(rpcArgs, cb)\n", binding.fn.Name())
+			fmt.Fprintf(buf, "if cb.err != nil { return starlark.None, cb.err }\n")
+			fmt.Fprintf(buf, "return env.InterfaceToStarlarkValue(cb.rpcRet), nil\n")
+		} else {
+			fmt.Fprintf(buf, "err := s.%s(rpcArgs, &rpcRet)\n", binding.fn.Name())
+			fmt.Fprintf(buf, "if err != nil { return starlark.None, err }\n")
+			fmt.Fprintf(buf, "return env.InterfaceToStarlarkValue(&rpcRet), nil\n")
+		}
 
 		fmt.Fprintf(buf, "})\n")
 
@@ -313,17 +367,23 @@ func spliceDocs(docpath string, docs []byte, outpath string) {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "gen-starlark-bindings [doc|doc/dummy|go] <destination file>\n\n")
-	fmt.Fprintf(os.Stderr, "Writes starlark documentation (doc) or mapping file (go) to <destination file>. Specify doc/dummy to generated documentation without overwriting the destination file.\n")
+	fmt.Fprintf(os.Stderr, "gen-starlark-bindings [doc|doc/dummy|go] <destination file> <skiplist>\n")
+	fmt.Fprintf(os.Stderr, "gen-starlark-bindings version\n\n")
+	fmt.Fprintf(os.Stderr, "Writes starlark documentation (doc) or mapping file (go) to <destination file>. Specify doc/dummy to generated documentation without overwriting the destination file.\nThe skiplist parameter is a comma separated list of API entrypoints to be skipped.\n\nIf passed 'version' prints the script version.\n")
 	os.Exit(1)
 }
 
 func main() {
-	if len(os.Args) != 3 {
+	if len(os.Args) != 4 {
+		if len(os.Args) == 2 && os.Args[1] == "version" {
+			fmt.Println("2")
+			return
+		}
 		usage()
 	}
 	kind := os.Args[1]
 	path := os.Args[2]
+	skiplist := strings.Split(os.Args[3], ",")
 
 	fset := &token.FileSet{}
 	cfg := &packages.Config{
@@ -342,7 +402,7 @@ func main() {
 	funcDeclByPos := make(map[token.Pos]*ast.FuncDecl)
 	packages.Visit(pkgs, func(pkg *packages.Package) bool {
 		if pkg.PkgPath == "github.com/go-delve/delve/service/rpc2" {
-			serverMethods = getSuitableMethods(pkg.Types, "RPCServer")
+			serverMethods = getSuitableMethods(pkg.Types, "RPCServer", skiplist)
 		}
 		for _, file := range pkg.Syntax {
 			ast.Inspect(file, func(n ast.Node) bool {
@@ -359,6 +419,10 @@ func main() {
 
 	switch kind {
 	case "go":
+		if len(os.Args) != 4 {
+			usage()
+		}
+
 		mapping := genMapping(bindings)
 
 		outfh := os.Stdout
